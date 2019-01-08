@@ -1,0 +1,515 @@
+-- quda interface
+do
+   local inited = false;
+   local solver = false;
+   local lattice = false;
+   local has_clover = false;
+   local mg_inverter = false;
+   qcd.quda = {};
+   qcd.quda.inverter = {};
+   function qcd.quda.init(L)
+      if inited then
+         error("Quda is already inited");
+      else
+         _quda.setVerbosityQuda("VERBOSE");
+         _quda.initCommsGridQuda(L);
+         _quda.initQuda();
+         lattice = L;
+      end
+      inited = true;
+   end
+   function qcd.quda.fini()
+      if inited then
+         if solver then
+            solver:fini();
+         end
+         if mg_inverter then
+            mg_inverter:close();
+         end
+         _quda.endQuda();
+         lattice = false;
+         inited = false;
+         mg_inverter = false;
+      else
+         error("Quda is not initialized\n");
+      end
+   end
+   local function compute_padding(lattice)
+      local vol = lattice:volume();
+      local i;
+      local padding = 0;
+      for i = 0, #L - 1 do
+         local face = vol / lattice[i];
+         if face > padding then
+            padding = face;
+         end
+      end
+      return padding
+   end
+   local function set_values(x,px)
+      local i, v;
+      for i,v in pairs(px) do
+         x[i] = v;	 
+      end
+   end
+   local function create_gauge_params(lattice,gpx,gx)
+      local net = lattice:network();
+      local gp = _quda.GaugeParam();
+      set_values(gp,gx);
+      gp.ga_pad                    = compute_padding(lattice);
+      gp.X                         = {lattice[0] / net[1],
+                                      lattice[1] / net[2],
+                                      lattice[2] / net[3],
+                                      lattice[3] / net[4]};
+      set_values(gp,gpx);
+      return gp;
+   end
+   local function create_invert_params(U,gparams,ipx,ipdef)
+      local padding = gparams.ga_pad;
+      local net = lattice:network();
+      local ip = _quda.InvertParam();
+      set_values(ip, ipdef);
+      set_values(ip,ipx);
+      if not ipx.mass then
+         ip.mass = 0.5/ip.kappa - (1 + 3/gparams.anisotropy);
+      end
+      if not ipx.kappa then
+         ip.kappa = 1.0 / (2.0 * (1 + 3/gparams.anisotropy + ip.mass));
+      end
+      return ip;
+   end
+   local function create_multigrid_params(mpx)
+      local level_defaults = {
+         verbosity                 = "SILENT",
+         setup_inv_type            = "BICGSTAB",
+         num_setup_iter            = 1,
+         setup_tol                 = 5e-6,
+         setup_maxiter             = 500,
+         spin_block_size           = 2,
+         mu_factor                 = 1.,
+         n_vec                     = 6,
+         nu_post                   = 2,
+         nu_pre                    = 2,
+         precision_null            = "SINGLE",
+         geo_block_size            = {4, 4, 4, 4},
+         cycle_type                = "RECURSIVE",
+         coarse_solver             = "GCR",
+         coarse_solver_tol         = 0.25,
+         coarse_solver_maxiter     = 100,
+         smoother                  = "MR",
+         smoother_tol              = 0.25,
+         smoother_solve_type       = "INVALID",
+         smoother_schwarz_type     = "INVALID",
+         global_reduction          = "YES",
+         coarse_grid_solution_type = "MAT",
+         omega                     = 1.0,
+         location                  = "CUDA",
+         setup_location            = "CUDA"
+      };
+      -- create the multigrid structure with defaults stolen from quda
+      -- multigrid_invert_test
+      local mp = _quda.MultigridParam();
+      mp.setup_type                = "NULL";
+      mp.post_orthonormalize       = "YES";
+      mp.pre_orthonormalize        = "NO";
+      mp.compute_null_vector       = "NO";
+      mp.generate_all_levels       = "YES";
+      mp.run_verify                = "YES";
+      mp.vec_infile                = "";
+      mp.vec_outfile               = "";
+      mp.n_level                   = 0;
+      local function setup_levels(mp,n,id,def,xx)
+         local v = {};
+         local i;
+         for i = 1, n do
+            v[i] = def;
+            if xx[i][id] then
+               v[i] = xx[i][id];
+            end
+         end
+         mp[id] = v;
+      end
+      for i,v in pairs(mpx) do
+         if i == "levels" then
+            local n = #mpx.levels;
+            mp.n_level = n;
+            for j,w in pairs(level_defaults) do
+               setup_levels(mp,n,j,w,mpx.levels);
+            end
+         else
+            mp[i] = v;
+         end
+      end
+      return mp;
+   end
+   local function load_gauge(U,gparams,iparams)
+      if not (#U == #lattice) then
+         error("Wrong number of color matrices in the gauge field");
+      end
+      for i = 1, #L do
+         if not (U[i].lattice == lattice) then
+            error("Gauge field component on a wrong lattice");
+         end
+      end
+      local V4 = U[4];
+      if (gparams.t_boundary == "ANTI_PERIODIC") then
+         local U4 = V4:copy();
+         lattice:Subset{axis=3, position=lattice[3]-1}:where(function () U4:set(-V4) end);
+         V4 = U4;
+      end
+      _quda.loadGaugeQuda({U[1],U[2],U[3],V4}, gparams);
+      if ((iparams.dslash_type == "CLOVER_WILSON") or
+       (iparams.dslash_type == "TWISTED_CLOVER")) then
+         _quda.loadCloverQuda(iparams);
+         has_clover = true;
+      end
+   end
+
+   -- Begin Clover Invert functions
+   function qcd.quda.inverter.simple(U, gpx, ipx)
+      local default_gp = {
+         type                      = "WILSON",
+         gauge_order               = "QDP",
+         gauge_fix                 = "NO",
+         cpu_prec                  = "DOUBLE",
+         cuda_prec                 = "DOUBLE",
+         cuda_prec_precondition    = "DOUBLE",
+         cuda_prec_sloppy          = "SINGLE",
+         reconstruct               = "NO",
+         reconstruct_sloppy        = "12",
+         reconstruct_precondition  = "INVALID",
+         anisotropy                = 1.0,
+         t_boundary                = "INVALID"
+      };
+      local default_clover_inverter = {
+         Ls                              = 1,
+         cl_pad                          = 0,
+         clover_cpu_prec                 = "DOUBLE",
+         clover_cuda_prec                = "DOUBLE",
+         clover_cuda_prec_precondition   = "SINGLE",
+         clover_cuda_prec_sloppy         = "SINGLE",
+         clover_order                    = "PACKED",
+         compute_clover                  = 0,
+         compute_clover_inverse          = 1,
+         cpu_prec                        = "DOUBLE",
+         cuda_prec                       = "DOUBLE",
+         cuda_prec_precondition          = "SINGLE",
+         cuda_prec_sloppy                = "SINGLE",
+         dagger                          = "NO",
+         dirac_order                     = "QDP",
+         dslash_type                     = "CLOVER_WILSON",
+         gamma_basis                     = "DEGRAND_ROSSI",
+         gcrNkrylov                      = 10,
+         input_location                  = "CPU",
+         inv_type                        = "BICGSTAB",
+         inv_type_precondition           = "CG",
+         mass_normalization              = "KAPPA",
+         matpc_type                      = "EVEN_EVEN",
+         maxiter_precondition            = 1,
+         mu                              = 0.0,
+         omega                           = 1.0,
+         output_location                 = "CPU",
+         pipeline                        = 0,
+         precondition_cycle              = 1,
+         preserve_source                 = "NO",
+         reliable_delta                  = 1e-10,
+         residual_type                   = "L2_RELATIVE",
+         return_clover_inverse           = 0,
+         schwarz_type                    = "ADDITIVE",
+         solution_type                   = "MAT",
+         solve_type                      = "DIRECT",
+         sp_pad                          = 0,
+         tol_precondition                = 1e-1,
+         twist_flavor                    = "NO",
+         verbosity                       = "SILENT",
+         verbosity_precondition          = "SILENT"
+      };
+      local obj = {};
+      local gparams = nil;
+      local iparams = nil;
+      function obj:close()
+         if has_clover then
+            _quda.freeCloverQuda();
+            has_clover = false;
+         end
+         _quda.freeGaugeQuda();
+         gparams = nil;
+         iparams = nil;
+         obj = {};
+         solver = false;
+      end
+      function obj:solve(rhs)
+         if not gparams then
+            error("Solver is closed");
+         end
+         local ip = iparams:copy();
+         local sol = _quda.invertQuda(rhs, ip);
+         return sol, ip;
+      end
+      function obj:plaqs()
+         if not gparams then
+            error("Solver is closed");
+         end
+         return _quda.plaqQuda();
+      end
+      function obj:__gc()
+         obj:close();
+      end
+      if not inited then
+         error("qcd.quda is not initialized");
+      end
+      if solver then
+         error("qcd.quda does not support multiple solvers");
+      end
+      gparams = create_gauge_params(lattice, gpx, default_gp);
+      iparams = create_invert_params(lattice, gparams, ipx, default_clover_inverter);
+      load_gauge(U,gparams,iparams);
+      solver = obj;
+      return obj;
+   end
+   function qcd.quda.inverter.multigrid(U, gpx, ipx, mpx, imx)
+      local default_gp = {
+         type                      = "WILSON",
+         gauge_order               = "QDP",
+         gauge_fix                 = "NO",
+         cpu_prec                  = "DOUBLE",
+         cuda_prec                 = "DOUBLE",
+         cuda_prec_precondition    = "SINGLE",
+         cuda_prec_sloppy          = "SINGLE",
+         reconstruct               = "NO",
+         reconstruct_sloppy        = "12",
+         reconstruct_precondition  = "INVALID",
+         anisotropy                = 1.0,
+         t_boundary                = "INVALID"
+      };
+      local outer_inv = {
+         Ls                                 = 1,
+         sp_pad                             = 0,
+         cl_pad                             = 0,
+         cpu_prec                           = "DOUBLE",
+         cuda_prec                          = "DOUBLE",
+         cuda_prec_precondition             = "SINGLE",
+         cuda_prec_sloppy                   = "SINGLE",
+         preserve_source                    = "NO",
+         gamma_basis                        = "DEGRAND_ROSSI",
+         dirac_order                        = "QDP",
+         clover_cpu_prec                    = "DOUBLE",
+         clover_cuda_prec                   = "DOUBLE",
+         clover_cuda_prec_precondition      = "SINGLE",
+         clover_cuda_prec_sloppy            = "SINGLE",
+         clover_order                       = "PACKED",
+         input_location                     = "CPU",
+         output_location                    = "CPU",
+         dslash_type                        = "CLOVER_WILSON",
+         dagger                             = "NO",
+         mass_normalization                 = "KAPPA",
+         solution_type                      = "MAT",
+         solve_type                         = "DIRECT",
+         matpc_type                         = "EVEN_EVEN",
+         inv_type                           = "GCR",
+         verbosity                          = "SILENT",
+         verbosity_precondition             = "SILENT",
+         inv_type_precondition              = "MG",
+         pipeline                           = 0,
+         gcrNkrylov                         = 10,
+         tol                                = 1e-7,
+         residual_type                      = "L2_RELATIVE",
+         tol_hq                             = 0.0,
+         maxiter                            = 1000,
+         reliable_delta                     = 1e-4,
+         schwarz_type                       = "ADDITIVE",
+         precondition_cycle                 = 1,
+         tol_precondition                   = 1e-1,
+         maxiter_precondition               = 1,
+         omega                              = 1.0,
+      };
+      local inner_inv = {
+         Ls                                 = 1,
+         sp_pad                             = 0,
+         cl_pad                             = 0,
+         cpu_prec                           = "DOUBLE",
+         cuda_prec                          = "DOUBLE",
+         cuda_prec_precondition             = "SINGLE",
+         cuda_prec_sloppy                   = "SINGLE",
+         preserve_source                    = "NO",
+         gamma_basis                        = "DEGRAND_ROSSI",
+         dirac_order                        = "QDP",
+         clover_cpu_prec                    = "DOUBLE",
+         clover_cuda_prec                   = "DOUBLE",
+         clover_cuda_prec_precondition      = "SINGLE",
+         clover_cuda_prec_sloppy            = "SINGLE",
+         clover_order                       = "PACKED",
+         input_location                     = "CPU",
+         output_location                    = "CPU",
+         dslash_type                        = "CLOVER_WILSON",
+         dagger                             = "NO",
+         mass_normalization                 = "KAPPA",
+         matpc_type                         = "EVEN_EVEN",
+         solution_type                      = "MATPC",
+         solve_type                         = "DIRECT",
+         inv_type                           = "GCR",
+         tol                                = 1e-10,
+         maxiter                            = 1000,
+         reliable_delta                     = 1e-10,
+         gcrNkrylov                         = 10,
+         verbosity                          = "SILENT",
+         verbosity_precondition             = "SILENT"
+      };
+      local obj = {};
+      local gparams = nil;
+      local iparams = nil;
+      local mparams = nil;
+      local impars = nil;
+      function obj:close()
+         if has_clover then
+            _quda.freeCloverQuda();
+            has_clover = false;
+         end
+         _quda.freeGaugeQuda();
+         mg_inverter:close();
+         mg_inverter = false;
+         gparams = nil;
+         iparams = nil;
+         mparams = nil;
+         impars = nil;
+         obj = {};
+         solver = false;
+      end
+      function obj:solve(rhs)
+         if not gparams then
+            error("Solver is closed");
+         end
+         local sol = _quda.invertQuda(rhs, mg_inverter);
+         return sol, iparams;
+      end
+      function obj:plaqs()
+         if not gparams then
+            error("Solver is closed");
+         end
+         return _quda.plaqQuda();
+      end
+      function obj:__gc()
+         obj:close();
+      end
+      if not inited then
+         error("qcd.quda is not initialized");
+      end
+      if solver then
+         error("qcd.quda does not support multiple solvers");
+      end
+      gparams = create_gauge_params(lattice, gpx, default_gp)
+      iparams = create_invert_params(lattice, gparams, ipx, outer_inv);
+      mparams = create_multigrid_params(mpx);
+      impars = create_invert_params(lattice, gparams, imx, inner_inv);
+      load_gauge(U,gparams,iparams);
+      mg_inverter = _quda.multigridQuda(iparams,mparams,impars);
+      solver = obj;
+      return obj;
+   end
+   -- End Clover Invert Functions
+      -------------------------------------------------------------------------
+   -- DMH Begin function Mobius DWF solver
+   function qcd.quda.MDWFsolver(U, gpx, ipx, bfive, cfive)
+      local default_MDWF_gp = {
+         type                      = "WILSON",
+         gauge_order               = "QDP",
+         gauge_fix                 = "NO",
+         cpu_prec                  = "DOUBLE",
+         cuda_prec                 = "DOUBLE",
+         cuda_prec_precondition    = "DOUBLE",
+         cuda_prec_sloppy          = "SINGLE",
+         reconstruct               = "NO",
+         reconstruct_sloppy        = "12",
+         reconstruct_precondition  = "INVALID",
+         anisotropy                = 1.0,
+         t_boundary                = "ANTI_PERIODIC"
+      };
+      local default_MDWF_ip = {
+         Ls                              = 16,
+	 b_5                             = bfive,
+	 c_5                             = cfive,
+         cpu_prec                        = "DOUBLE",
+         cuda_prec                       = "DOUBLE",
+         cuda_prec_precondition          = "SINGLE",
+         cuda_prec_sloppy                = "SINGLE",
+         dagger                          = "NO",
+         dirac_order                     = "QDP",
+         dslash_type                     = "MOBIUS_DWF",
+         gamma_basis                     = "DEGRAND_ROSSI",
+         gcrNkrylov                      = 10,
+         input_location                  = "CPU",
+         inv_type                        = "CG",
+         inv_type_precondition           = "CG",
+         mass_normalization              = "KAPPA",
+         matpc_type                      = "EVEN_EVEN",
+         maxiter_precondition            = 1,
+         mu                              = 0.0,
+         omega                           = 1.0,
+         output_location                 = "CPU",
+         pipeline                        = 0,
+         precondition_cycle              = 1,
+         preserve_source                 = "NO",
+         reliable_delta                  = 1e-10,
+         residual_type                   = "L2_RELATIVE",
+         return_clover_inverse           = 0,
+         schwarz_type                    = "ADDITIVE",
+         solution_type                   = "MAT",
+         solve_type                      = "NORMOP",
+         sp_pad                          = 0,
+         tol_precondition                = 1e-1,
+         twist_flavor                    = "NO",
+         verbosity                       = "VERBOSE",
+         verbosity_precondition          = "VERBOSE"
+      };
+      
+      local obj = {};
+      local gparams = nil;
+      local iparams = nil;
+      function obj:close()
+         _quda.freeGaugeQuda();
+         gparams = nil;
+         iparams = nil;
+         obj = {};
+         solver = false;
+      end
+      function obj:getInvParam()
+         if not gparams then
+            error("Solver is closed");
+         end
+         local ip = iparams:copy();
+	 return ip;
+      end
+      --Redundant for the moment
+      function obj:solve(rhs5D, rhs4D)
+         if not gparams then
+            error("Solver is closed");
+         end
+         local ip = iparams:copy();
+         local sol = _quda.MDWFinvertQuda(rhs5D, ip, rhs4D);
+         return sol, ip;
+      end
+      --
+      function obj:plaqs()
+         if not gparams then
+            error("Solver is closed");
+         end
+         return _quda.plaqQuda();
+      end      
+      function obj:__gc()
+         obj:close();
+      end      
+      if not inited then
+         error("qcd.quda is not initialized");
+      end
+      if solver then
+         error("qcd.quda does not support multiple solvers");
+      end
+      -- The solve function body
+      gparams = create_gauge_params(lattice, gpx, default_MDWF_gp)
+      iparams = create_invert_params(lattice, gparams, ipx, default_MDWF_ip);
+      load_gauge(U, gparams, iparams);
+      solver = obj;
+      return obj;
+   end
+   -- DMH END function Mobius DWF solver   
+end

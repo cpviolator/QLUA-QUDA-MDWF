@@ -1,0 +1,61 @@
+First, get the right build directory:
+
+        GIT_SSL_NO_VERIFY=1 git clone https://usqcd.lns.mit.edu/git/LHPC/Public/build2.git; cd build2; git checkout build2-20170804
+
+This is the version that has a tested QUDA interface. Then, get the source code of the
+dependencies
+
+        GIT_SSL_NO_VERIFY=1 make TARGET=fnal-pi0g update
+
+We must then edit the edit the file configs/fnal-pi0g to ensure
+it knows where your CUDA build is, and also that we wish to use the best
+sm_XX availible.
+
+        # CUDA installation
+        CUDA.root = /usr/local/cuda-7.0
+
+will need to change, as will
+
+        -DQUDA_GPU_ARCH=sm_35
+
+to refect the change to the CUDA version and sm_XX. We must also edit the script to allow HDF5 to compile.
+
+Next obstacle is the GSL version that is downloaded is custom. It has a set of complex
+QR decomposition routines written by Andrew, and the version he wrote them in does
+not compile on Sierra. The solution is to download a different version of gsl that has
+the complex QR routines and compiles on Sierra. Navigate to
+
+        build2/parts/gsl
+
+and execute
+
+        git clone https://github.com/mangroveck/gsl-qr-complex-devel.git
+
+you then move (or delete) the original 'tree' directory, and move the new gsl
+directory to 'tree'.
+
+        mv tree tree_old; mv gsl-qr-complex-devel tree
+
+You must then generate the configure script.
+
+        mv tree; autoreconf -i
+
+Last, you must edit the HDF5.config so that the libdl library is included
+
+        HDF5.config = CC="$(XCC)" \
+                      CFLAGS="$(XCFLAGS)" \
+                      LD="$(XCC) -ldl" \
+                      --prefix="$(HDF5.dest)" \
+                      --enable-parallel
+
+and also in the qlua.libs line
+
+         QLUA.libs   = z cudart dl
+
+This should be sufficient to compile a QUDA enables Qlua. We may then make.
+
+         make PREFIX=/g/g90/howarth1/clean_QLUA/QLUA TARGET=fnal-pi0g
+
+Once you are satisfied that QLUA has compiled correctly, copy the source code
+files over and recompile.
+

@@ -1,0 +1,231 @@
+package.path = 'qlib/?.qlua;lhpc/?.qlua;' .. package.path;
+
+require "strict"
+require "stdlib"
+require "gauge"
+require "latvec"
+require "lhpc-std"
+require "quda"
+require "MDWFutils"
+
+printf("Test for variable complex b and c\n");
+
+-- parameters.
+Lx = 4;
+Lt = 4;
+
+L = qcd.lattice{Lx, Lx, Lx, Lt};
+-- the lattice and a random generator state.
+do
+   local l_s = 1
+   l_id = L:Int(0)
+   for d = 0, #L - 1 do
+      l_id = l_id + l_s * L:pcoord(d)
+      l_s = l_s * L[d]
+   end
+   S = L:RandomState(1984, l_id)
+end
+
+print_network_settings()
+print_subgrid_settings(L)
+
+bc  = {1, 1, 1, -1}
+rnd_seed = 1984
+mdwf_M5 = 0.0
+mdwf_mf = 0.1
+mdwf_L5 = 16
+b5_val  = 1.0
+mdwf_c5 = {}
+mdwf_b5 = {}
+for s = 1, mdwf_L5 do
+   mdwf_b5[s] = b5_val
+   mdwf_c5[s] = mdwf_b5[s] - 1.0
+end
+
+--- random SU(3) gauge field.
+U = {};
+do
+   for d = 1, #L do
+      U[d] = toSUn(S:gaussian_ColorMatrix() * 0.4);
+   end
+end
+
+--- point source Dirac fermion fields.
+sources = {{0,0,0,0}}
+start_time = os.time()
+SrcVec = sources[1] 
+SrcStr = "x" .. tostring(SrcVec[1]) .. "_y" .. tostring(SrcVec[2]) .. "_z" .. tostring(SrcVec[3]) .. "_t" .. tostring(SrcVec[4])
+printf("Source: %s\n", SrcStr)
+src4d = MakePointSource(SrcVec)
+-- convert 4d src to 5d and apply D- for Moebius
+src5d = apply_Dminus(U, bc, mdwf_L5, mdwf_M5, mdwf_b5, mdwf_c5, src4d)
+
+mval_list = {0.100}
+soln_Prop = {}
+soln_Prop5 ={}
+for m = 1, #mval_list do
+   soln_Prop[m] = L:DiracPropagator(); -- 4D solution goes here.
+   soln_Prop5[m] = {}; -- 5D solution goes here.
+   for s = 0,mdwf_L5-1 do
+      soln_Prop5[m][1+s] = L:DiracPropagator(); -- Prepare memory!
+   end
+end
+
+printf("Time to prepare source %s: %d sec \n\n", SrcStr, os.difftime(os.time(), start_time))
+
+
+-- Solve for all spin-color.
+for ic = 0,src4d:colors()-1 do -- for all colors
+   for is = 0,qcd.Ns-1 do -- and spins
+      
+      -- Create a 5D source for one spin-color.
+      local_Source5 = {}
+      for s=0,mdwf_L5-1 do
+	 local_Source5[1+s] = src5d[1+s][{c=ic,d=is}];
+      end
+      
+   end
+end
+
+--- Gaussian Dirac fermion fields.
+Ftest = S:gaussian_DiracFermion()
+F = {}
+for i = 1, mdwf_L5 do
+   F[i] = S:gaussian_DiracFermion()
+end
+
+--- compare two fermions
+function check_result(f1, f2)
+   for i = 1, mdwf_L5 do
+      local n1 = f1[i]:norm2();
+      local n2 = f2[i]:norm2();
+      local df = f1[i] - f2[i];
+      local nd = df:norm2();
+      printf("DiracFermion abs diff %.12e (%.12e - %.12e)\n", nd, n1, n2);      
+   end
+end
+
+
+--- compare two fermions modulo norm
+function check_norm_result(f1, f2)
+   for i = 1, mdwf_L5 do
+      local nx1 = math.sqrt(f1[i]:norm2());
+      local nx2 = math.sqrt(f2[i]:norm2());
+      local df = f1[i]/nx1 - f2[i]/nx2;
+      local nd = df:norm2();
+      printf("DiracFermion scaled rel diff %.12g (%.12g, %.12g) ratio: %.12g\n",
+	     nd, nx1, nx2, nx1 / nx2);
+   end
+end
+
+
+
+-- CPU Solver
+-- reference MDWF operator with antiperiodic BCs in time
+-- This is the example code from the tests directory in QLUA
+-- it runs on the CPU and will provide a reference to the GPU problem.
+--------------------------------------------------------------------------------------
+-- init MDWF lib 
+DW = qcd.MDWF.generic(U, bc, mdwf_L5, mdwf_M5, mdwf_mf, mdwf_b5, mdwf_c5)
+-- gauge field for "gold MDWF"
+bc_U = gauge_copy(U)
+gauge_apply_boundary(bc_U, bc)
+
+-- solver test
+solver = DW:solver(1e-12, 50000) -- construct solver
+
+--Fs = S:gaussian_DiracFermion()
+dinv_5d_Fcpu = solver(local_Source5, true, true)           -- launch solver (quiet)
+
+dinv_4d_Fcpu = dwf_sol_5D_to_4D(dinv_5d_Fcpu, mdwf_L5)
+
+-- Apply operator to check the inverse, should give back original F
+d_dinv_Fcpu = latvec_op_dslash_moebius(dinv_5d_Fcpu, bc_U, mdwf_M5, mdwf_mf,
+				       mdwf_b5, mdwf_c5)
+
+check_result(local_Source5, d_dinv_Fcpu)
+
+-- original F
+printf(">>>> |F| = %25.15e\n", latvec_norm2(local_Source5))
+-- M^{-1} * F
+printf(">>>> |dinv_F|  = %25.15e\n", latvec_norm2(dinv_5d_Fcpu))
+-- M * M^{-1} * F
+printf(">>>> |d_dinv_F| = %25.15e\n", latvec_norm2(d_dinv_Fcpu))
+-- (M * M^{-1} * F) - F . This should be as close to zero as you can tolerate: sqrt(tol)
+printf(">>>> |d_dinv_F - F| = %25.15e\n", latvec_norm2(latvec_scalsum_left(1., d_dinv_Fcpu, -1., local_Source5)))
+-- This computes the above result against a "gold" standard...
+print_latvec_cmp(local_Source5, d_dinv_Fcpu, ">>>> F <-> Dgold(Dinv(F))")
+-- Another test.
+printf(">>>> solver : |a-b| %25.15e\n", latvec_norm2(latvec_sub(d_dinv_Fcpu, local_Source5)));
+-------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+-- GPU Solver
+-- We will reuse the gauge field, the source vectors, and the b and c parameters so that
+-- one can see with clarity how to construct scripts using QUDA
+-------------------------------------------------------------------------------------
+--- test the QUDA inverter
+
+-- spinor contains the source, and returns the solution
+function run_solver(solver, U, mdwf_M5, mdwf_mf, mdwf_L5, mdwf_b5, mdwf_c5, spinor5D)
+   qcd.quda.init(L);   
+   -- Args to MDFW are gauge field, gauge param, invert param
+   -- We can set the params as we pass them.
+
+   local QS = qcd.quda.MDWFsolver(U,
+				  {t_boundary          = "ANTI_PERIODIC"},				  
+				  {m5                  = mdwf_M5,
+				   mass                = mdwf_mf,
+				   Ls                  = mdwf_L5,
+				   tol                 = 1e-12,
+				   dslash_type          = "DOMAIN_WALL",
+				   maxiter             = 10000},
+				  mdwf_b5,
+				  mdwf_c5);
+   
+   local invParam = QS:getInvParam()
+   local dinv_F = solver(spinor5D, true, true, true, invParam) -- (verbose)
+   printf("QS solver invParams output:");
+   printf("iter      = %d\n", invParam.iter);
+   printf("true_res  = %g\n", invParam.true_res);
+   QS:close();
+   qcd.quda.fini(L);
+   return dinv_F;
+end
+
+-- GPU COMPARISON
+dinv_Fgpu = run_solver(solver, U, mdwf_M5, mdwf_mf, mdwf_L5,
+		       mdwf_b5, mdwf_c5, local_Source5);
+-- Apply operator to check the inverse, should give back original F
+d_dinv_Fgpu = latvec_op_dslash_moebius(dinv_Fgpu, bc_U, mdwf_M5, mdwf_mf, mdwf_b5, mdwf_c5)
+
+check_result(local_Source5, d_dinv_Fgpu)
+
+-- original F
+printf(">>>> |F| = %25.15e\n", latvec_norm2(local_Source5))
+
+-- M^{-1} * F
+printf(">>>> |dinv_Fgpu|  = %25.15e\n", latvec_norm2(dinv_Fgpu))
+
+-- M * M^{-1} * F
+printf(">>>> |d_dinv_Fgpu| = %25.15e\n", latvec_norm2(d_dinv_Fgpu))
+
+-- (M * M^{-1} * F) - F . This should be as close to zero as you can tolerate.
+printf(">>>> |d_dinv_Fgpu - F| = %25.15e\n", latvec_norm2(latvec_scalsum_left(1., d_dinv_Fgpu, -1., local_Source5)))
+
+-- This computes the above result against a "gold" standard...
+print_latvec_cmp(F, d_dinv_Fgpu, ">>>> F <-> Dgold(Dinv(F))")
+
+-- Another test.
+printf(">>>> solver : |a-b| %25.15e\n", latvec_norm2(latvec_sub(d_dinv_Fgpu, local_Source5)));
+
+os.exit(1);
