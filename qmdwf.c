@@ -322,7 +322,7 @@ static int q_dirac_solver(lua_State *L) {
   double out_eps;
   int out_iters;
   int log_level;
-  int i;
+  int i, index;
 
     switch (lua_type(L, 2)) {
     case LUA_TNONE:
@@ -444,16 +444,18 @@ static int q_dirac_solver(lua_State *L) {
 	      int ci, x[4];
 	      double *ptr;
 	      QDP_get_coords_L(S->lat, x, S->node, j);
-	      ci = quda_index(x, lo, hi);
+	      ci = quda_index(x, lo, hi);   // Should differ for different j...
 	      
+              index = i * vol * sp_sze_real + ci * sp_sze_real;
 	      for (int c = 0; c < 3; c++) {
 		for (int d = 0; d < 4; d++) {
 
-		  q_rhs[i*vol*sp_sze_real + ci*sp_sze_real + 2 * 4 * c + 2 * d]   =
-		    QLA_real(QLA_D3_elem_D(e_psi[i][j], c, d));
-		  
-		  q_rhs[i*vol*sp_sze_real + ci*sp_sze_real + 2 * 4 * c + 2 * d + 1] =
-		    QLA_imag(QLA_D3_elem_D(e_psi[i][j], c, d));
+		  q_rhs[index] = QLA_real(QLA_D3_elem_D(e_psi[i][j], c, d));
+		  q_sol[index] = 0.0;
+		  index++;
+		  q_rhs[index] = QLA_imag(QLA_D3_elem_D(e_psi[i][j], c, d));
+		  q_sol[index] = 0.0;
+		  index++;
 
 		  /*
 		  printf("QUDA source: %d %d %d %d (%.12e,%.12e) %s\n", i, j, d, c,
@@ -463,8 +465,6 @@ static int q_dirac_solver(lua_State *L) {
 			 fabs(QLA_imag(QLA_D3_elem_D(e_psi[i][j], c, d))) > 0 ?
 			 "<--------" : "");
 		  */
-		  q_sol[i*vol*sp_sze_real + ci*sp_sze_real + 2 * 4 * c + 2 * d]     = 0.0;
-		  q_sol[i*vol*sp_sze_real + ci*sp_sze_real + 2 * 4 * c + 2 * d + 1] = 0.0;
 		}
 	      }
 	    }
@@ -497,13 +497,16 @@ static int q_dirac_solver(lua_State *L) {
 	      int ci, x[4];
 	      double *ptr;
 	      QDP_get_coords_L(S->lat, x, S->node, j);
-	      ci = quda_index(x, lo, hi);
+	      ci = quda_index(x, lo, hi);   // Should differ for different j...
 	      
+              index = i * vol * sp_sze_real + ci * sp_sze_real;
 	      for (int c = 0; c < 3; c++) {
 		for (int d = 0; d < 4; d++) {
 		  
-		  double re = q_sol[i*vol*sp_sze_real + ci*sp_sze_real + 2 * 4 * c + 2 * d    ];
-		  double im = q_sol[i*vol*sp_sze_real + ci*sp_sze_real + 2 * 4 * c + 2 * d + 1];
+		  double re = q_sol[index];
+                  index++;
+		  double im = q_sol[index];
+                  index++;
 		  
 		  QLA_c_eq_r_plus_ir(QLA_D3_elem_D(e_eta[i][j], c, d), re, im);
 		  
